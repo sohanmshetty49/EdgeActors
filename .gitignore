@@ -1,0 +1,23 @@
+# Maven
+target/
+*.jar
+*.war
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+
+# Java
+*.class
+*.classPath
+*.classpath
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+*.log
