@@ -53,10 +53,16 @@ public final class NodeMain {
         LocalActorHost host = defaultHost();
         LocationRegistry registry = new LocationRegistry();
         try (MigrationManager manager = new MigrationManager(host, registry, transport, config.peers(),
-            MigrationManager.Config.defaults())) {
+                 MigrationManager.Config.defaults());
+             AutoMigrator auto = config.autoMigration()
+                 ? new AutoMigrator(manager, host, config.autoMigrate()) : null) {
             NodeShell shell = new NodeShell(manager, host, registry, transport);
             out.println("node " + config.name() + " listening on port " + config.port()
                 + (config.tls() ? " with mutual TLS" : " over plain TCP") + ", peers " + config.peers());
+            if (auto != null) {
+                auto.start();
+                out.println("auto-migration on: " + auto.policy().describe());
+            }
             out.println("type help for commands");
             String line;
             while ((line = in.readLine()) != null) {
