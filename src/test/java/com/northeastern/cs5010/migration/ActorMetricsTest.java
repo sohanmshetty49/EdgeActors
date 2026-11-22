@@ -56,7 +56,7 @@ class ActorMetricsTest {
         piNode.awaitCount("c", 10);
         String line = pi.execute("metrics c");
         assertTrue(line.startsWith("c: node=pi mailbox=0 processed=10 avgProcessingMicros="), line);
-        assertTrue(line.endsWith(" failures=0"), line);
+        assertTrue(line.endsWith(" failures=0 restarts=0"), line);
 
         assertTrue(pi.execute("migrate c cloud").startsWith("COMMITTED"));
         assertEquals("c: node=cloud (metrics are kept on that node)", pi.execute("metrics c"));

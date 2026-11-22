@@ -132,11 +132,16 @@ public final class NodeShell {
             return id + " is unknown on " + manager.nodeName();
         }
         if (!host.hosts(id)) {
+            String reason = host.stoppedReason(id);
+            if (reason != null) {
+                return id + ": node=" + location + " stopped by its supervisor (" + reason + ")";
+            }
             return id + ": node=" + location + " (metrics are kept on that node)";
         }
         LocalActorHost.ActorMetrics m = host.metrics(id);
-        return String.format(java.util.Locale.ROOT, "%s: node=%s mailbox=%d processed=%d avgProcessingMicros=%.1f failures=%d",
-            id, location, m.mailboxDepth(), m.processed(), m.averageProcessingMicros(), m.failures());
+        return String.format(java.util.Locale.ROOT,
+            "%s: node=%s mailbox=%d processed=%d avgProcessingMicros=%.1f failures=%d restarts=%d",
+            id, location, m.mailboxDepth(), m.processed(), m.averageProcessingMicros(), m.failures(), m.restarts());
     }
 
     private String stats() {
@@ -151,7 +156,8 @@ public final class NodeShell {
             + " aborts=" + manager.abortCount()
             + " heapUsedMb=" + usedMb
             + " heapMaxMb=" + rt.maxMemory() / (1024 * 1024)
-            + " cores=" + rt.availableProcessors();
+            + " cores=" + rt.availableProcessors()
+            + " deadLetters=" + host.deadLetterCount();
     }
 
     static String describe(MigrationManager.Result r) {
