@@ -23,7 +23,8 @@ class HandoffMessageTest {
             HandoffMessage.committed("a", 4),
             HandoffMessage.abort("a", 4),
             HandoffMessage.query("a", 4),
-            HandoffMessage.forward("a", 5, "payload"));
+            HandoffMessage.forward("a", 5, "payload"),
+            HandoffMessage.drained("a", 4));
         for (HandoffMessage m : all) {
             assertEquals(m, HandoffMessage.decode(m.encode()), m.type().name());
         }

@@ -32,13 +32,14 @@ import java.util.Objects;
  *   ABORT(epoch)            --->    drop held state
  *   QUERY(epoch)            --->    "did you commit?" used to resolve IN_DOUBT
  *   FORWARD(epoch, payload) --->    route a message that reached an old location
+ *   DRAINED(epoch)          --->    old location has forwarded everything it held
  * </pre>
  */
 public record HandoffMessage(Type type, String actorId, String actorType, long epoch, long requestId,
                              String state, List<String> messages, String reason) {
 
     public enum Type {
-        PREPARE, PREPARED, REJECT, COMMIT, COMMITTED, ABORT, QUERY, FORWARD
+        PREPARE, PREPARED, REJECT, COMMIT, COMMITTED, ABORT, QUERY, FORWARD, DRAINED
     }
 
     private static final int VERSION = 1;
@@ -83,6 +84,11 @@ public record HandoffMessage(Type type, String actorId, String actorType, long e
 
     public static HandoffMessage forward(String actorId, long epoch, String payload) {
         return new HandoffMessage(Type.FORWARD, actorId, null, epoch, 0, null, List.of(payload), null);
+    }
+
+    /** Sent by the old node after the last message it had to forward for this handoff. */
+    public static HandoffMessage drained(String actorId, long epoch) {
+        return new HandoffMessage(Type.DRAINED, actorId, null, epoch, 0, null, null, null);
     }
 
     /** A copy of this message tagged with the given request id. */

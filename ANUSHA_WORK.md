@@ -88,11 +88,33 @@ Every request carries a `requestId` and every reply echoes it, so a late reply t
 | COMMIT arrives after the destination's lease expired, or install fails | REJECT; the source restores the actor locally |
 | No reply to COMMIT after all retries | IN_DOUBT: the actor is paused and its messages held. `resolve` sends QUERY; the destination answers COMMITTED (the source finishes the move) or REJECT (the destination discards held state so a late COMMIT can never apply, and the source restores the actor) |
 
+### Reliable, ordered forwarding (fix found by network fault injection)
+
+Shravya's network fault injection (`MigrationFaultHarness`) found two bugs in the handoff protocol:
+1. **Loss during a partition.** When the old node could not forward a message because the link was down, the message was dropped and only logged. The sender never knew.
+2. **Reordering when an actor moves back toward its sender.** Messages sent before the move travel through the old node and could arrive after newer messages delivered directly.
+
+Fixes in `MigrationManager`:
+- **Ordered outbox per peer.** A forwarded message that cannot be sent is kept and retried in order every 100 ms until it goes through. A new message never overtakes a waiting one. A client's own send still fails with an IOException while the link is down. Protocol requests and replies are dropped instead of queued while forwards are waiting; the protocol already recovers from that through its timeouts.
+- **Drain fence.** After COMMITTED the old node forwards what it still buffered, then sends a new `DRAINED` message. Until it arrives, the new node holds messages from its own clients and releases them in order afterwards. If DRAINED never arrives, they are released after `drainTimeout` (10 s by default). An actor still draining is not migrated again until the drain finishes.
+
+Before and after, over randomized runs with delays, lost replies and partitions:
+
+| | Lost | Out of order | Two live copies | Duplicates |
+|---|---:|---:|---:|---:|
+| Before the fix (30 runs with partitions) | 121 | 0 | 0 | 0 |
+| Before the fix (30 runs, actor moves back, no faults) | 0 | 5 | 0 | 0 |
+| After the fix (every scenario) | 0 | 0 | 0 | 0 |
+
+Tests: `ReliableForwardingTest` (forwards across a down link are retried in order instead of lost; a client's send still fails visibly; protocol messages do not overtake waiting forwards; an actor moving back gets its sender's messages in order; held messages are released if DRAINED never arrives), with `FlakyLink`, a test transport that fails chosen sends.
+
 ## Correctness argument
 
 ### Handoff invariants
 
-**I1, no loss.** A message sent to a migrating actor goes to exactly one of three places: the old instance (before the freeze), the buffer (after the freeze), or forwarding (after the move). The freeze and the "is it migrating?" check happen under the same per-actor lock as delivery, so no message can slip between them. Everything in the buffer when COMMIT is sent travels inside COMMIT; anything that arrives later is forwarded after COMMITTED, under the same lock, before any newer message can be routed. On every abort path the buffer is replayed locally, oldest first. A message is therefore dropped only if a node holds no route newer than the one the message already used, or a forward fails on the network; both are logged and counted.
+**I1, no loss.** A message sent to a migrating actor goes to exactly one of three places: the old instance (before the freeze), the buffer (after the freeze), or forwarding (after the move). The freeze and the "is it migrating?" check happen under the same per-actor lock as delivery, so no message can slip between them. Everything in the buffer when COMMIT is sent travels inside COMMIT; anything that arrives later is forwarded after COMMITTED, under the same lock, before any newer message can be routed. On every abort path the buffer is replayed locally, oldest first. A forward that cannot be sent because the link is down is kept in an ordered outbox and retried until it goes through, so a network partition delays forwarded messages instead of losing them. A client's own send that cannot reach the actor fails with an IOException, so the client knows it was not accepted. A message is therefore dropped only if a node holds no route newer than the one the message already used, which is logged and counted.
+
+**Order.** Messages from one sender keep their order across a move. Forwards to a peer leave through one ordered outbox, and protocol messages never overtake waiting forwards. When an actor arrives, the new node holds messages from its own clients until the old node sends DRAINED, which follows everything the old node still had to forward. So a message sent before the move, which travels through the old node, is never overtaken by a later one delivered directly. If DRAINED never arrives, the held messages are released after the drain timeout.
 
 **I2, no duplication.** The only message that carries actor messages between nodes in a batch is COMMIT, and it can be retried. The destination applies COMMIT only when it holds prepared state for exactly that epoch, and applying it moves the destination's epoch past it. A retried COMMIT for an epoch the destination has already passed is acknowledged but not applied. After IN_DOUBT resolves as committed, the source drops its copy of the batch instead of forwarding it again.
 

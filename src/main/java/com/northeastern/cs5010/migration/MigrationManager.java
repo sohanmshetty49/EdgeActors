@@ -6,15 +6,19 @@ import com.northeastern.cs5010.transport.LocationRegistry;
 import com.northeastern.cs5010.transport.LocationRegistry.Status;
 import java.io.IOException;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
@@ -56,6 +60,22 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>Forwarded messages carry the sender's epoch, and a node only forwards
  * further when it knows a strictly newer epoch. Epochs only grow, so stale
  * routing information can never bounce a message between nodes forever.
+ *
+ * <p><b>Ordered, retried forwarding.</b> Every message to a peer goes through
+ * one ordered outbox per peer. A forwarded message that cannot be sent because
+ * the link is down is kept and retried, in order, until it goes through, so a
+ * network partition delays forwarded messages instead of losing them. A
+ * client's own send still fails with an IOException when the link is down, so
+ * the client knows that message was not accepted. Protocol messages never jump
+ * ahead of waiting forwards; while the outbox is not empty they are dropped,
+ * which the protocol already handles through its timeouts.
+ *
+ * <p><b>Drain fence.</b> After COMMITTED the old node forwards what it still
+ * buffered and then sends DRAINED. Until DRAINED arrives, the new node holds
+ * messages from its own clients instead of delivering them, so a message sent
+ * before the move, which travels through the old node, is never overtaken by a
+ * later one sent directly. If DRAINED never comes, the held messages are
+ * released after the drain timeout.
  */
 public final class MigrationManager implements AutoCloseable {
 
@@ -75,16 +95,28 @@ public final class MigrationManager implements AutoCloseable {
     /**
      * Tuning knobs. replyTimeout bounds each wait for the destination,
      * commitAttempts is how often COMMIT is retried, idleTimeout bounds the
-     * freeze step, prepareLease is how long a destination holds prepared state.
+     * freeze step, prepareLease is how long a destination holds prepared state,
+     * drainTimeout is how long a new location waits for DRAINED before it
+     * releases the messages it is holding.
      */
-    public record Config(Duration replyTimeout, int commitAttempts, Duration idleTimeout, Duration prepareLease) {
+    public record Config(Duration replyTimeout, int commitAttempts, Duration idleTimeout, Duration prepareLease,
+                         Duration drainTimeout) {
+
+        public static final Duration DEFAULT_DRAIN_TIMEOUT = Duration.ofSeconds(10);
+
         public Config {
             Objects.requireNonNull(replyTimeout, "replyTimeout");
             Objects.requireNonNull(idleTimeout, "idleTimeout");
             Objects.requireNonNull(prepareLease, "prepareLease");
+            Objects.requireNonNull(drainTimeout, "drainTimeout");
             if (commitAttempts < 1) {
                 throw new IllegalArgumentException("commitAttempts must be at least 1");
             }
+        }
+
+        /** Same, with the default drain timeout. */
+        public Config(Duration replyTimeout, int commitAttempts, Duration idleTimeout, Duration prepareLease) {
+            this(replyTimeout, commitAttempts, idleTimeout, prepareLease, DEFAULT_DRAIN_TIMEOUT);
         }
 
         public static Config defaults() {
@@ -105,6 +137,37 @@ public final class MigrationManager implements AutoCloseable {
     private record Pending(long requestId, CompletableFuture<HandoffMessage> reply) {
     }
 
+    /** One encoded message waiting in a peer's outbox. */
+    private record Outgoing(String encoded, boolean forward) {
+    }
+
+    /** What to do with a message that cannot be sent right now. */
+    private enum OnFailure {
+        /** Tell the caller: a client's own send. */
+        THROW,
+        /** Keep it and retry in order: forwarded messages and DRAINED. */
+        QUEUE,
+        /** Give up quietly: protocol requests and replies, which have their own timeouts. */
+        DROP
+    }
+
+    /**
+     * Messages held on a new location until the old one says it has forwarded
+     * everything it buffered. Only touched under lockFor(actorId).
+     */
+    private static final class Fence {
+        final String from;
+        final long epoch;
+        final List<String> held = new ArrayList<>();
+
+        Fence(String from, long epoch) {
+            this.from = from;
+            this.epoch = epoch;
+        }
+    }
+
+    private static final long RETRY_MILLIS = 100;
+
     private final String nodeName;
     private final ActorHost host;
     private final LocationRegistry registry;
@@ -118,13 +181,19 @@ public final class MigrationManager implements AutoCloseable {
     private final AtomicLong requestIds = new AtomicLong();
     private final Map<String, Prepared> prepared = new ConcurrentHashMap<>();
     private final Map<String, InDoubt> inDoubt = new ConcurrentHashMap<>();
+    private final Map<String, Fence> fences = new ConcurrentHashMap<>();
+    private final Map<String, Deque<Outgoing>> outbox = new ConcurrentHashMap<>();
+    private final Map<String, Object> outboxLocks = new ConcurrentHashMap<>();
+    private final Set<String> retrying = ConcurrentHashMap.newKeySet();
     private final ExecutorService inbound;
     private final ScheduledExecutorService timers;
+    private final ScheduledExecutorService retrier;
 
     private final AtomicLong forwarded = new AtomicLong();
     private final AtomicLong dropped = new AtomicLong();
     private final AtomicLong commits = new AtomicLong();
     private final AtomicLong aborts = new AtomicLong();
+    private final AtomicLong retried = new AtomicLong();
 
     /**
      * @param peers maps every other node's name to its "host:port" address
@@ -142,6 +211,7 @@ public final class MigrationManager implements AutoCloseable {
         // FORWARDs that follow it.
         this.inbound = Executors.newSingleThreadExecutor(daemon(nodeName + "-handoff"));
         this.timers = Executors.newSingleThreadScheduledExecutor(daemon(nodeName + "-lease"));
+        this.retrier = Executors.newSingleThreadScheduledExecutor(daemon(nodeName + "-retry"));
         transport.setListener((sender, payload) -> inbound.execute(() -> handle(sender, payload)));
     }
 
@@ -184,7 +254,7 @@ public final class MigrationManager implements AutoCloseable {
             if (registry.getLocation(actorId) == null) {
                 throw new IllegalArgumentException("unknown actor " + actorId);
             }
-            route = routeLocked(actorId, payload);
+            route = routeLocked(actorId, payload, null);
         }
         if (route != null) {
             forward(route.node(), actorId, route.epoch(), payload);
@@ -200,9 +270,26 @@ public final class MigrationManager implements AutoCloseable {
         if (!peers.containsKey(destination)) {
             return result(Outcome.ABORTED, "unknown destination " + destination, start);
         }
+        // An actor that just arrived may still be receiving forwards from its old
+        // node. Moving it on before that finishes would separate the held messages
+        // from the ones still coming, so wait for the drain, bounded by idleTimeout.
+        long drainDeadline = System.nanoTime() + config.idleTimeout().toNanos();
+        while (fences.containsKey(actorId) && System.nanoTime() < drainDeadline) {
+            try {
+                Thread.sleep(1);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return result(Outcome.ABORTED, "interrupted while waiting for the previous handoff to drain", start);
+            }
+        }
         long epoch;
         String type;
         synchronized (lockFor(actorId)) {
+            Fence fence = fences.get(actorId);
+            if (fence != null) {
+                return result(Outcome.ABORTED, actorId + " is still receiving messages forwarded from "
+                    + fence.from + "; try again shortly", start);
+            }
             if (!host.hosts(actorId) || !registry.beginMigration(actorId, nodeName)) {
                 return result(Outcome.ABORTED, actorId + " is not active on " + nodeName, start);
             }
@@ -300,11 +387,38 @@ public final class MigrationManager implements AutoCloseable {
         return aborts.get();
     }
 
+    /** Messages sent later than first tried, because the link was down at the time. */
+    public long retriedCount() {
+        return retried.get();
+    }
+
+    /** Messages waiting in outboxes for a link to come back. */
+    public int queuedCount() {
+        int n = 0;
+        for (Map.Entry<String, Deque<Outgoing>> e : outbox.entrySet()) {
+            synchronized (outboxLock(e.getKey())) {
+                n += e.getValue().size();
+            }
+        }
+        return n;
+    }
+
+    /** True while this node holds an arriving actor's local messages until the old node has drained. */
+    public boolean isDraining(String actorId) {
+        return fences.containsKey(actorId);
+    }
+
     @Override
     public void close() {
         transport.setListener(null);
         inbound.shutdownNow();
         timers.shutdownNow();
+        retrier.shutdownNow();
+        int waiting = queuedCount();
+        if (waiting > 0) {
+            LOG.log(System.Logger.Level.WARNING, nodeName + " closed with " + waiting
+                + " messages still waiting for an unreachable node");
+        }
     }
 
     // -------------------------------------------------------- source side
@@ -313,7 +427,9 @@ public final class MigrationManager implements AutoCloseable {
         Pending pending = new Pending(requestIds.incrementAndGet(), new CompletableFuture<>());
         awaiting.put(actorId, pending);
         try {
-            transport.send(address(destination), message.withRequestId(pending.requestId()).encode());
+            if (!sendOrdered(destination, message.withRequestId(pending.requestId()).encode(), false, OnFailure.DROP)) {
+                return null; // link down or earlier messages still waiting; the caller treats it as no reply
+            }
             return pending.reply().get(config.replyTimeout().toMillis(), TimeUnit.MILLISECONDS);
         } catch (IOException | TimeoutException | ExecutionException e) {
             return null;
@@ -336,6 +452,8 @@ public final class MigrationManager implements AutoCloseable {
             for (String payload : drainBuffer(actorId)) {
                 forwardQuietly(destination, actorId, epoch + 1, payload);
             }
+            // Tells the new location it can deliver its own clients' messages now.
+            sendReliably(destination, HandoffMessage.drained(actorId, epoch).encode());
         }
         commits.incrementAndGet();
         return result(Outcome.COMMITTED, "", start);
@@ -380,7 +498,8 @@ public final class MigrationManager implements AutoCloseable {
                 }
             }
             case QUERY -> onQuery(sender, msg);
-            case FORWARD -> onForward(msg);
+            case FORWARD -> onForward(sender, msg);
+            case DRAINED -> onDrained(sender, msg);
             case PREPARED, REJECT, COMMITTED -> {
                 Pending pending = awaiting.get(msg.actorId());
                 // Only the answer to the request in flight counts; a late reply
@@ -442,14 +561,15 @@ public final class MigrationManager implements AutoCloseable {
                     reply = HandoffMessage.reject(id, msg.epoch(), "no prepared state for epoch " + msg.epoch());
                 } else {
                     prepared.remove(id);
-                    reply = install(id, held, msg);
+                    reply = install(id, held, msg, sender);
                 }
             }
         }
         sendQuietly(sender, msg.answer(reply));
     }
 
-    private HandoffMessage install(String id, Prepared held, HandoffMessage commit) {
+    /** Caller holds lockFor(id). */
+    private HandoffMessage install(String id, Prepared held, HandoffMessage commit, String from) {
         try {
             host.install(id, held.actorType(), held.state());
         } catch (RuntimeException e) {
@@ -459,7 +579,43 @@ public final class MigrationManager implements AutoCloseable {
         for (String payload : commit.messages()) {
             host.deliver(id, payload);
         }
+        // Hold this node's own messages until the old node has forwarded everything it still has.
+        Fence fence = new Fence(from, commit.epoch());
+        fences.put(id, fence);
+        try {
+            timers.schedule(() -> openFence(id, fence, true), config.drainTimeout().toMillis(), TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException closed) {
+            fences.remove(id, fence);
+        }
         return HandoffMessage.committed(id, commit.epoch());
+    }
+
+    private void onDrained(String sender, HandoffMessage msg) {
+        Fence fence = fences.get(msg.actorId());
+        if (fence != null && fence.from.equals(sender) && fence.epoch == msg.epoch()) {
+            openFence(msg.actorId(), fence, false);
+        }
+    }
+
+    /** Delivers what the fence held, in order, and removes it. */
+    private void openFence(String id, Fence fence, boolean timedOut) {
+        synchronized (lockFor(id)) {
+            if (!fences.remove(id, fence)) {
+                return; // already opened
+            }
+            if (timedOut) {
+                LOG.log(System.Logger.Level.WARNING, "no DRAINED from " + fence.from + " for " + id + " within "
+                    + config.drainTimeout() + "; releasing " + fence.held.size() + " held messages");
+            }
+            for (String payload : fence.held) {
+                try {
+                    host.deliver(id, payload);
+                } catch (IllegalArgumentException gone) {
+                    dropped.incrementAndGet();
+                    LOG.log(System.Logger.Level.ERROR, id + " is no longer hosted; dropped a held message");
+                }
+            }
+        }
     }
 
     private void onQuery(String sender, HandoffMessage msg) {
@@ -477,7 +633,7 @@ public final class MigrationManager implements AutoCloseable {
         sendQuietly(sender, msg.answer(reply));
     }
 
-    private void onForward(HandoffMessage msg) {
+    private void onForward(String sender, HandoffMessage msg) {
         String id = msg.actorId();
         String payload = msg.messages().isEmpty() ? "" : msg.messages().get(0);
         Route route;
@@ -491,7 +647,7 @@ public final class MigrationManager implements AutoCloseable {
                     "dropping message for " + id + ": no route newer than epoch " + msg.epoch());
                 return;
             }
-            route = routeLocked(id, payload);
+            route = routeLocked(id, payload, sender);
         }
         if (route != null) {
             forwardQuietly(route.node(), id, route.epoch(), payload);
@@ -512,12 +668,21 @@ public final class MigrationManager implements AutoCloseable {
 
     // ------------------------------------------------------------ helpers
 
-    /** Caller holds lockFor(actorId) and has checked the actor is known. */
-    private Route routeLocked(String actorId, String payload) {
+    /**
+     * Caller holds lockFor(actorId) and has checked the actor is known.
+     *
+     * @param arrivedFrom the node that forwarded this message, or null for a local client
+     */
+    private Route routeLocked(String actorId, String payload, String arrivedFrom) {
         String location = registry.getLocation(actorId);
         if (location.equals(nodeName)) {
             if (registry.getStatus(actorId) == Status.ACTIVE) {
-                host.deliver(actorId, payload);
+                Fence fence = fences.get(actorId);
+                if (fence != null && !fence.from.equals(arrivedFrom)) {
+                    fence.held.add(payload); // the old node is still forwarding older messages
+                } else {
+                    host.deliver(actorId, payload);
+                }
             } else {
                 buffers.computeIfAbsent(actorId, k -> new ArrayList<>()).add(payload);
             }
@@ -531,34 +696,128 @@ public final class MigrationManager implements AutoCloseable {
         return buffered == null ? new ArrayList<>() : buffered;
     }
 
+    /** A client's message: sent in order, or an IOException so the client knows it was not accepted. */
     private void forward(String node, String actorId, long epoch, String payload) throws IOException {
-        transport.send(address(node), HandoffMessage.forward(actorId, epoch, payload).encode());
-        forwarded.incrementAndGet();
+        sendOrdered(node, HandoffMessage.forward(actorId, epoch, payload).encode(), true, OnFailure.THROW);
     }
 
+    /** A message this node already accepted: sent in order, and retried while the link is down. */
     private void forwardQuietly(String node, String actorId, long epoch, String payload) {
         try {
-            forward(node, actorId, epoch, payload);
+            sendOrdered(node, HandoffMessage.forward(actorId, epoch, payload).encode(), true, OnFailure.QUEUE);
         } catch (IOException e) {
-            dropped.incrementAndGet();
+            dropped.incrementAndGet(); // only for a node with no known address
             LOG.log(System.Logger.Level.ERROR, "could not forward a message for " + actorId + " to " + node, e);
         }
     }
 
-    private void sendQuietly(String node, HandoffMessage msg) {
+    private void sendReliably(String node, String encoded) {
         try {
-            transport.send(address(node), msg.encode());
+            sendOrdered(node, encoded, false, OnFailure.QUEUE);
         } catch (IOException e) {
+            LOG.log(System.Logger.Level.ERROR, "no address for " + node, e);
+        }
+    }
+
+    private void sendQuietly(String node, HandoffMessage msg) {
+        boolean sent;
+        try {
+            sent = sendOrdered(node, msg.encode(), false, OnFailure.DROP);
+        } catch (IOException e) {
+            sent = false;
+        }
+        if (!sent) {
             LOG.log(System.Logger.Level.WARNING, "could not send " + msg.type() + " to " + node);
         }
     }
 
-    private String address(String node) throws IOException {
+    /**
+     * Sends to a peer through its ordered outbox. Anything already waiting is
+     * retried first, and a new message never overtakes a waiting one. Returns
+     * true if the message was sent, or kept for retry in QUEUE mode.
+     */
+    private boolean sendOrdered(String node, String encoded, boolean forward, OnFailure onFailure)
+            throws IOException {
         String address = peers.get(node);
         if (address == null) {
+            if (onFailure == OnFailure.DROP) {
+                return false;
+            }
             throw new IOException("no address known for node " + node);
         }
-        return address;
+        synchronized (outboxLock(node)) {
+            Deque<Outgoing> waiting = outbox.computeIfAbsent(node, k -> new ArrayDeque<>());
+            flushLocked(address, waiting);
+            if (waiting.isEmpty()) {
+                try {
+                    transport.send(address, encoded);
+                    if (forward) {
+                        forwarded.incrementAndGet();
+                    }
+                    return true;
+                } catch (IOException e) {
+                    if (onFailure == OnFailure.THROW) {
+                        throw e;
+                    }
+                    if (onFailure == OnFailure.DROP) {
+                        return false;
+                    }
+                }
+            } else if (onFailure == OnFailure.THROW) {
+                throw new IOException("link to " + node + " is down: " + waiting.size()
+                    + " earlier messages are still waiting");
+            } else if (onFailure == OnFailure.DROP) {
+                return false;
+            }
+            waiting.addLast(new Outgoing(encoded, forward));
+            scheduleRetry(node);
+            return true;
+        }
+    }
+
+    /** Sends waiting messages in order until one fails. Caller holds outboxLock(node). */
+    private void flushLocked(String address, Deque<Outgoing> waiting) {
+        while (!waiting.isEmpty()) {
+            Outgoing next = waiting.peekFirst();
+            try {
+                transport.send(address, next.encoded());
+            } catch (IOException e) {
+                return; // still down; try again later
+            }
+            waiting.pollFirst();
+            retried.incrementAndGet();
+            if (next.forward()) {
+                forwarded.incrementAndGet();
+            }
+        }
+    }
+
+    private void scheduleRetry(String node) {
+        if (retrying.add(node)) {
+            try {
+                retrier.schedule(() -> retry(node), RETRY_MILLIS, TimeUnit.MILLISECONDS);
+            } catch (RejectedExecutionException closed) {
+                retrying.remove(node);
+            }
+        }
+    }
+
+    private void retry(String node) {
+        retrying.remove(node);
+        synchronized (outboxLock(node)) {
+            Deque<Outgoing> waiting = outbox.get(node);
+            if (waiting == null || waiting.isEmpty()) {
+                return;
+            }
+            flushLocked(peers.get(node), waiting);
+            if (!waiting.isEmpty()) {
+                scheduleRetry(node);
+            }
+        }
+    }
+
+    private Object outboxLock(String node) {
+        return outboxLocks.computeIfAbsent(node, k -> new Object());
     }
 
     private Object lockFor(String actorId) {
