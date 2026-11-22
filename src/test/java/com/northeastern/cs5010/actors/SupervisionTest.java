@@ -135,9 +135,9 @@ class SupervisionTest {
         ActorRef grandchild = system.spawnChild(child, Counter.class, "grandchild", Supervision.DEFAULT);
         awaitStarted("parent", "child", "grandchild");
         tell(child, "boom");
-        await(() -> !system.isAlive(parent));
-        assertFalse(system.isAlive(child));
-        assertFalse(system.isAlive(grandchild));
+        // The stop runs on the child's thread and walks down the tree, so the
+        // parent can be marked stopped a moment before its descendants are.
+        await(() -> !system.isAlive(parent) && !system.isAlive(child) && !system.isAlive(grandchild));
         await(() -> EVENTS.containsAll(List.of("parent:stop", "child:stop", "grandchild:stop")));
     }
 
