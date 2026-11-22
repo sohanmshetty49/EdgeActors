@@ -67,11 +67,12 @@ final class ActorCell {
         }
     }
 
-    /** Delivers one message; returns the failure, if any, after releasing the lock. */
+    /**
+     * Delivers one message; returns the failure, if any, after releasing the
+     * lock. A message already taken from the mailbox is always processed, even
+     * if a stop arrives at the same moment, so it is never dropped uncounted.
+     */
     synchronized RuntimeException process(Message message) {
-        if (stopped) {
-            return null;
-        }
         try {
             instance.receive(message);
             return null;

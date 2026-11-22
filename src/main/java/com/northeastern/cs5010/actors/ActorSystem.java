@@ -107,6 +107,14 @@ public class ActorSystem {
             return;
         }
         cell.mailbox.enqueue(message);
+        if (cell.stopped) {
+            // The actor stopped between the check above and the enqueue, so its
+            // final mailbox drain may already have run. Drain again so the
+            // message is counted as a dead letter instead of vanishing.
+            while (cell.mailbox.poll() != null) {
+                deadLetters.incrementAndGet();
+            }
+        }
     }
 
     /**

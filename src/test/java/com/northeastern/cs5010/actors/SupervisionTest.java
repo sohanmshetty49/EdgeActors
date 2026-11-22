@@ -194,6 +194,29 @@ class SupervisionTest {
         await(() -> EVENTS.stream().filter(e -> e.endsWith(":count=0")).count() == 20);
     }
 
+    @Test
+    void messagesSentWhileAnActorStopsAreNeverSilentlyLost() throws Exception {
+        // Regression test: a send racing with stop used to leave the message in a
+        // dead mailbox where nobody processed or counted it.
+        java.util.concurrent.atomic.AtomicLong processed = new java.util.concurrent.atomic.AtomicLong();
+        PROCESSED.set(processed);
+        long sent = 0;
+        for (int round = 0; round < 200; round++) {
+            ActorRef c = system.actorOf(Tally.class, "tally-" + round);
+            Thread stopper = new Thread(() -> system.stop(c));
+            stopper.start();
+            for (int i = 0; i < 50; i++) {
+                tell(c, "x");
+                sent++;
+            }
+            stopper.join();
+        }
+        long expected = sent;
+        await(() -> processed.get() + system.deadLetterCount() == expected);
+        assertEquals(expected, processed.get() + system.deadLetterCount(),
+            "every message is either processed or counted as a dead letter");
+    }
+
     // ------------------------------------------------------- core behaviour
 
     @Test
@@ -332,6 +355,17 @@ class SupervisionTest {
                 case "boom" -> throw new IllegalStateException("boom in " + self.getPath());
                 default -> { }
             }
+        }
+    }
+
+    static final java.util.concurrent.atomic.AtomicReference<java.util.concurrent.atomic.AtomicLong> PROCESSED =
+        new java.util.concurrent.atomic.AtomicReference<>(new java.util.concurrent.atomic.AtomicLong());
+
+    /** Counts every message it processes into PROCESSED. */
+    public static class Tally extends Actor {
+        @Override
+        public void receive(Message message) {
+            PROCESSED.get().incrementAndGet();
         }
     }
 
