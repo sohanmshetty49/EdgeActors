@@ -22,8 +22,12 @@ import java.util.function.BiConsumer;
  */
 public abstract class FramedTransport implements AsyncTransport {
 
-    /** Upper bound on one frame body, guards against corrupt length prefixes. */
-    public static final int MAX_FRAME = 1 << 20;
+    /**
+     * Upper bound on one frame body, guards against corrupt length prefixes.
+     * 8 MiB leaves room for migrating an actor with 1 MB of state, which is
+     * about 1.4 MB once encoded.
+     */
+    public static final int MAX_FRAME = 1 << 23;
 
     static final long DEFAULT_RECEIVE_TIMEOUT_MS = 5_000;
     private static final int INBOX_CAPACITY = 1_000;
@@ -141,32 +145,54 @@ public abstract class FramedTransport implements AsyncTransport {
     record HostPort(String host, int port) {
     }
 
-    /** Reassembles frames from arbitrary TCP chunks. */
+    /**
+     * Reassembles frames from arbitrary TCP chunks.
+     *
+     * <p>Unread bytes sit at the start of {@code acc}, in [0, position). The
+     * buffer grows by doubling, so a large frame arriving in many small reads
+     * is copied a bounded number of times instead of once per read. After a
+     * large frame the buffer shrinks back, so an idle connection holds little
+     * memory.
+     */
     static final class FrameDecoder {
-        private ByteBuffer acc = ByteBuffer.allocate(0);
+        private static final int INITIAL = 8 * 1024;
+        private ByteBuffer acc = ByteBuffer.allocate(INITIAL);
 
         void feed(ByteBuffer in) {
-            ByteBuffer grown = ByteBuffer.allocate(acc.remaining() + in.remaining());
-            grown.put(acc).put(in).flip();
-            acc = grown;
+            if (acc.remaining() < in.remaining()) {
+                int needed = acc.position() + in.remaining();
+                ByteBuffer grown = ByteBuffer.allocate(Math.max(needed, acc.capacity() * 2));
+                acc.flip();
+                grown.put(acc);
+                acc = grown;
+            }
+            acc.put(in);
         }
 
         /** Returns the next complete frame body, or null if more bytes are needed. */
         String next() {
-            if (acc.remaining() < 4) {
+            int end = acc.position();
+            if (end < 4) {
                 return null;
             }
-            acc.mark();
-            int len = acc.getInt();
+            int len = acc.getInt(0);
             if (len < 0 || len > MAX_FRAME) {
                 throw new IllegalStateException("bad frame length " + len);
             }
-            if (acc.remaining() < len) {
-                acc.reset();
+            if (end - 4 < len) {
                 return null;
             }
             byte[] body = new byte[len];
-            acc.get(body);
+            acc.get(4, body);
+            int rest = end - 4 - len;
+            if (acc.capacity() > INITIAL && rest <= INITIAL) {
+                ByteBuffer small = ByteBuffer.allocate(INITIAL);
+                small.put(0, acc, 4 + len, rest);
+                acc = small;
+            } else {
+                acc.put(0, acc, 4 + len, rest);
+            }
+            acc.position(rest);
             return new String(body, StandardCharsets.UTF_8);
         }
     }

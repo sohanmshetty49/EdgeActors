@@ -23,6 +23,7 @@ public final class NodeShell {
         "status <actor>                location, epoch, state and, if hosted here, the counter",
         "metrics <actor>               current node, mailbox depth, processed, mean processing time",
         "stats                         transport and migration counters, memory, cores",
+        "pause <node> <bytes> [runs]   time migrations of an actor with that much state (default 5 runs)",
         "quit                          stop this node");
 
     private final MigrationManager manager;
@@ -30,6 +31,7 @@ public final class NodeShell {
     private final LocationRegistry registry;
     private final FramedTransport transport;
     private final Map<String, Long> nextSeq = new HashMap<>();
+    private long pauseRuns;
 
     public NodeShell(MigrationManager manager, LocalActorHost host, LocationRegistry registry,
                      FramedTransport transport) {
@@ -57,12 +59,16 @@ public final class NodeShell {
                 case "status" -> status(arg(t, 1, "status <actor>"));
                 case "metrics" -> metrics(arg(t, 1, "metrics <actor>"));
                 case "stats" -> stats();
+                case "pause" -> pause(t);
                 default -> "unknown command '" + t[0] + "', type help";
             };
         } catch (IllegalArgumentException | IllegalStateException e) {
             return "error: " + e.getMessage();
         } catch (IOException e) {
             return "network error: " + e.getMessage();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "interrupted";
         }
     }
 
@@ -158,6 +164,56 @@ public final class NodeShell {
             + " heapMaxMb=" + rt.maxMemory() / (1024 * 1024)
             + " cores=" + rt.availableProcessors()
             + " deadLetters=" + host.deadLetterCount();
+    }
+
+    /**
+     * Measures migration pause time: each run starts a fresh blob actor with
+     * the given state size here, waits until it holds that state, then times
+     * its migration to the node. Reports mean, standard deviation, min, max.
+     */
+    private String pause(String[] t) throws InterruptedException {
+        String usage = "pause <node> <bytes> [runs]";
+        String node = arg(t, 1, usage);
+        int bytes = Integer.parseInt(arg(t, 2, usage));
+        int runs = t.length > 3 ? Integer.parseInt(t[3]) : 5;
+        if (bytes < 0 || runs < 1) {
+            throw new IllegalArgumentException("bytes must be at least 0 and runs at least 1");
+        }
+        double[] millis = new double[runs];
+        int committed = 0;
+        String lastProblem = "";
+        for (int i = 0; i < runs; i++) {
+            String id = "pause-" + manager.nodeName() + "-" + (++pauseRuns);
+            manager.spawn(id, BlobActor.TYPE);
+            host.deliver(id, "fill " + bytes);
+            if (!host.awaitIdle(id, java.time.Duration.ofSeconds(30))) {
+                throw new IllegalStateException(id + " did not build its state in time");
+            }
+            long start = System.nanoTime();
+            MigrationManager.Result r = manager.migrate(id, node);
+            millis[i] = (System.nanoTime() - start) / 1e6;
+            if (r.committed()) {
+                committed++;
+            } else {
+                lastProblem = " (" + r.outcome() + ": " + r.reason() + ")";
+            }
+        }
+        double mean = 0;
+        double min = Double.MAX_VALUE;
+        double max = 0;
+        for (double m : millis) {
+            mean += m / runs;
+            min = Math.min(min, m);
+            max = Math.max(max, m);
+        }
+        double var = 0;
+        for (double m : millis) {
+            var += (m - mean) * (m - mean);
+        }
+        double sd = runs > 1 ? Math.sqrt(var / (runs - 1)) : 0;
+        return String.format(java.util.Locale.ROOT,
+            "pause %d bytes to %s, %d runs: mean %.2f ms, sd %.2f ms, min %.2f ms, max %.2f ms, %d of %d committed%s",
+            bytes, node, runs, mean, sd, min, max, committed, runs, lastProblem);
     }
 
     static String describe(MigrationManager.Result r) {

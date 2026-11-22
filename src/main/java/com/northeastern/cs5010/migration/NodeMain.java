@@ -91,7 +91,9 @@ public final class NodeMain {
 
     /** The actor types every node can create or receive. */
     static LocalActorHost defaultHost() {
-        Map<String, Supplier<? extends MigratableActor>> factories = Map.of(CounterActor.TYPE, CounterActor::new);
+        Map<String, Supplier<? extends MigratableActor>> factories = Map.of(
+            CounterActor.TYPE, CounterActor::new,
+            BlobActor.TYPE, BlobActor::new);
         return new LocalActorHost(factories);
     }
 }
