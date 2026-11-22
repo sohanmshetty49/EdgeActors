@@ -283,6 +283,22 @@ public class ActorSystem {
         return cell == null ? 0 : cell.restarts.get();
     }
 
+    /** Messages this actor has processed, including ones whose receive threw. */
+    public long processedCount(ActorRef ref) {
+        ActorCell cell = cells.get(ref.getId());
+        return cell == null ? 0 : cell.processed.get();
+    }
+
+    /** Mean time spent in receive per message, in microseconds; 0 before the first message. */
+    public double averageProcessingMicros(ActorRef ref) {
+        ActorCell cell = cells.get(ref.getId());
+        if (cell == null) {
+            return 0;
+        }
+        long n = cell.processed.get();
+        return n == 0 ? 0 : cell.processingNanos.get() / 1_000.0 / n;
+    }
+
     /** The most recent failure of a running actor, or null. */
     public Throwable lastFailure(ActorRef ref) {
         ActorCell cell = cells.get(ref.getId());

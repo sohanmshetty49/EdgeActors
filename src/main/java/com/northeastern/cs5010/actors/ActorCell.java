@@ -28,6 +28,8 @@ final class ActorCell {
     final Set<ActorCell> children = ConcurrentHashMap.newKeySet();
     final AtomicLong failures = new AtomicLong();
     final AtomicLong restarts = new AtomicLong();
+    final AtomicLong processed = new AtomicLong();
+    final AtomicLong processingNanos = new AtomicLong();
 
     volatile boolean stopped;
     volatile boolean started;
@@ -73,11 +75,16 @@ final class ActorCell {
      * if a stop arrives at the same moment, so it is never dropped uncounted.
      */
     synchronized RuntimeException process(Message message) {
+        long start = System.nanoTime();
         try {
             instance.receive(message);
             return null;
         } catch (RuntimeException e) {
             return e;
+        } finally {
+            // Failed messages count too: they used the actor's time.
+            processingNanos.addAndGet(System.nanoTime() - start);
+            processed.incrementAndGet();
         }
     }
 

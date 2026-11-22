@@ -1,6 +1,7 @@
 package com.northeastern.cs5010.migration;
 
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
@@ -9,6 +10,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -25,11 +27,25 @@ public final class LocalActorHost implements ActorHost {
     private final Map<String, Supplier<? extends MigratableActor>> factories;
     private final Map<String, Hosted> actors = new ConcurrentHashMap<>();
 
+    /**
+     * A snapshot of one actor's metrics on this node.
+     *
+     * @param mailboxDepth messages queued or running right now
+     * @param processed messages handled since the actor was installed here
+     * @param averageProcessingMicros mean time spent in onMessage per message
+     * @param failures messages whose onMessage threw
+     */
+    public record ActorMetrics(int mailboxDepth, long processed, double averageProcessingMicros, long failures) {
+    }
+
     private static final class Hosted {
         final String type;
         final MigratableActor actor;
         final ExecutorService mailbox = Executors.newSingleThreadExecutor(Thread.ofVirtual().factory());
         final AtomicInteger pending = new AtomicInteger();
+        final AtomicLong processed = new AtomicLong();
+        final AtomicLong processingNanos = new AtomicLong();
+        final AtomicLong failures = new AtomicLong();
 
         Hosted(String type, MigratableActor actor) {
             this.type = type;
@@ -80,15 +96,34 @@ public final class LocalActorHost implements ActorHost {
         Hosted h = require(actorId);
         h.pending.incrementAndGet();
         h.mailbox.execute(() -> {
+            long start = System.nanoTime();
             try {
                 h.actor.onMessage(payload);
             } catch (RuntimeException e) {
                 // One bad message must not kill the actor's mailbox thread.
+                h.failures.incrementAndGet();
                 LOG.log(System.Logger.Level.WARNING, actorId + " failed on a message", e);
             } finally {
+                h.processingNanos.addAndGet(System.nanoTime() - start);
+                h.processed.incrementAndGet();
                 h.pending.decrementAndGet();
             }
         });
+    }
+
+    /** Mailbox depth, processed count, mean processing time and failures of a hosted actor. */
+    public ActorMetrics metrics(String actorId) {
+        Hosted h = require(actorId);
+        long n = h.processed.get();
+        double avg = n == 0 ? 0 : h.processingNanos.get() / 1_000.0 / n;
+        return new ActorMetrics(h.pending.get(), n, avg, h.failures.get());
+    }
+
+    /** Current mailbox depth of every actor hosted here. */
+    public Map<String, Integer> mailboxDepths() {
+        Map<String, Integer> depths = new HashMap<>();
+        actors.forEach((id, h) -> depths.put(id, h.pending.get()));
+        return depths;
     }
 
     @Override

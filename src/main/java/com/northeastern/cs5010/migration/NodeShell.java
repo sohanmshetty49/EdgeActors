@@ -21,6 +21,7 @@ public final class NodeShell {
         "resolve <actor>               settle an IN_DOUBT migration",
         "learn <actor> <node> [epoch]  record that an actor lives on another node",
         "status <actor>                location, epoch, state and, if hosted here, the counter",
+        "metrics <actor>               current node, mailbox depth, processed, mean processing time",
         "stats                         transport and migration counters, memory, cores",
         "quit                          stop this node");
 
@@ -54,6 +55,7 @@ public final class NodeShell {
                 case "resolve" -> describe(manager.resolve(arg(t, 1, "resolve <actor>")));
                 case "learn" -> learn(t);
                 case "status" -> status(arg(t, 1, "status <actor>"));
+                case "metrics" -> metrics(arg(t, 1, "metrics <actor>"));
                 case "stats" -> stats();
                 default -> "unknown command '" + t[0] + "', type help";
             };
@@ -122,6 +124,19 @@ public final class NodeShell {
             out.append(state);
         }
         return out.toString();
+    }
+
+    private String metrics(String id) {
+        String location = registry.getLocation(id);
+        if (location == null) {
+            return id + " is unknown on " + manager.nodeName();
+        }
+        if (!host.hosts(id)) {
+            return id + ": node=" + location + " (metrics are kept on that node)";
+        }
+        LocalActorHost.ActorMetrics m = host.metrics(id);
+        return String.format(java.util.Locale.ROOT, "%s: node=%s mailbox=%d processed=%d avgProcessingMicros=%.1f failures=%d",
+            id, location, m.mailboxDepth(), m.processed(), m.averageProcessingMicros(), m.failures());
     }
 
     private String stats() {
