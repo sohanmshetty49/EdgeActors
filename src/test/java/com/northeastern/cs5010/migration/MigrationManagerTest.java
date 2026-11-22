@@ -102,7 +102,9 @@ class MigrationManagerTest {
             cloud.awaitCount("c", 100);
             LocalCluster.assertInvariants(cloud.counter("c"), 100);
             assertEquals(2, cloud.registry.getEpoch("c"));
-            assertEquals(100, edge2.manager.forwardedCount());
+            // edge2 counts a forward just after sending it, so cloud can finish
+            // the last message a moment before edge2's counter catches up.
+            awaitForwarded(edge2, 100);
         }
     }
 
@@ -473,6 +475,14 @@ class MigrationManagerTest {
         assertEquals(epoch, node.registry.getEpoch(actorId));
         assertEquals(Status.ACTIVE, node.registry.getStatus(actorId));
         assertFalse(node.manager.isInDoubt(actorId));
+    }
+
+    private static void awaitForwarded(Node node, long expected) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (node.manager.forwardedCount() < expected && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5);
+        }
+        assertEquals(expected, node.manager.forwardedCount());
     }
 
     private static void awaitDropped(Node node, long expected) throws InterruptedException {
