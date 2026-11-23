@@ -91,12 +91,61 @@ cost about the same as raw channels while adding supervision and addressing.
 
 ### Results on the Raspberry Pi and cloud node
 
-To fill in after running the command above on each machine:
+The Pi and laptop runs of these benchmarks are recorded in `SOHAN_WORK.md`
+under "Pi evaluation".
 
-| Machine | threads+locks (ops/s) | channels (ops/s) | actors (ops/s) | actors read p99 (us) |
-|---|---:|---:|---:|---:|
-| Raspberry Pi | | | | |
-| Cloud node | | | | |
+### Network fault injection
+
+The crash harness above covers actor failures. These classes add the
+network faults from the Phase 1 plan: message delay, lost protocol messages,
+and network partitions, injected into real live migrations.
+
+- `ChaosTransport` wraps a real transport. **Delay:** each send waits a
+  random time first, in the sending thread, so messages to one node stay in
+  order as over TCP. **Lost protocol messages:** PREPARE, PREPARED, REJECT,
+  COMMIT, COMMITTED, ABORT and QUERY are dropped with a given probability;
+  FORWARD and DRAINED belong to the ordered data stream, which TCP does not
+  lose on a working link. **Partition:** while the shared `Network` is cut,
+  every send fails with an IOException in both directions.
+- `SequenceRecorder` is a migratable actor that records exactly which
+  numbered messages arrived, so loss, duplication and reordering can be told
+  apart, and its record moves with it.
+- `MigrationFaultHarness` runs randomized live migrations: two real nodes
+  ("pi" and "cloud") over TCP on one machine, a client streaming numbered
+  messages through the Pi, a migration to the cloud at a random moment
+  (sometimes back again), random delays, lost replies, and a partition at a
+  random time for a random length. Migrations left IN_DOUBT are resolved after
+  the network heals. A monitor thread samples both nodes throughout.
+- Checked on every run: **I1** every accepted message arrived (a send that
+  failed with an error was reported to the client and is not lost); **I2** no
+  message arrived twice, and none reported as failed arrived anyway;
+  **order** numbers arrived in increasing order; **I3** never two active
+  copies, and exactly one at the end; and no migration left undecided.
+
+```
+java -cp target/classes com.northeastern.cs5010.bench.BenchmarkMain --net-faults 200 2>/dev/null
+```
+
+The first runs found two real protocol bugs: messages lost when a forward hit
+a partitioned link, and reordering when an actor moved back toward its
+sender. Both were fixed in `MigrationManager` (see `ANUSHA_WORK.md`). After the
+fix, 50 randomized runs per row on a 2-core cloud VM:
+
+| Faults injected | Runs | Sent | Accepted | Reported to sender | Lost | Duplicates | Out of order | Two live copies | Committed | Aborted | In doubt, resolved | Unresolved | Partitions | Protocol msgs lost | Sends refused by partition |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| delay up to 3 ms | 50 | 15000 | 15000 | 0 | 0 | 0 | 0 | 0 | 75 | 0 | 0 | 0 | 0 | 0 | 0 |
+| delay up to 2 ms, 10% of protocol messages lost | 50 | 15000 | 15000 | 0 | 0 | 0 | 0 | 0 | 62 | 13 | 1 | 0 | 0 | 31 | 0 |
+| delay up to 2 ms, 5% of protocol messages lost, partition in 100% of runs | 50 | 15000 | 12957 | 2043 | 0 | 0 | 0 | 0 | 34 | 41 | 1 | 0 | 50 | 10 | 2329 |
+
+Every row: 0 lost, 0 duplicates, 0 out of order, never two live copies,
+and every migration decided. "Reported to sender" are sends made during a
+partition, which failed with an error the client saw.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs `mvn -B clean verify` on Java 21 (Temurin) for
+every push to `main` and every pull request, and keeps the JaCoCo coverage
+report as a build artifact (plus the Surefire reports when a test fails).
 
 ### Tests
 
@@ -108,7 +157,8 @@ To fill in after running the command above on each machine:
 | `BenchmarkRunnerTest` | Every model processes the workload correctly with the same writes; failures surface; wrong totals flagged |
 | `FaultInjectionHarnessTest` | No faults; recovery from 2% crashes with 0 lost; exhausted budget stops workers with 0 lost; stop policy; plan determinism and rate |
 | `BenchmarkMainTest` | Full CLI run with CSV and fault table, defaults, bad arguments return exit code 2, report formatting |
+| `NetworkFaultTest` | Partitions cut both directions until healed; only requests and replies are dropped; delays keep order; the recorder detects loss, duplicates and reordering; all invariants hold under delay, lost replies and partitions; the `--net-faults` table |
 
-44 tests; about 98% instruction and 97% branch coverage for the `baselines`
+51 tests; about 97% instruction and 90% branch coverage for the `baselines`
 and `bench` packages. Stable over repeated runs, including runs pinned to a
 single CPU core.
