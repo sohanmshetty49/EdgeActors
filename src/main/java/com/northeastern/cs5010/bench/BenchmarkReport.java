@@ -54,6 +54,31 @@ public final class BenchmarkReport {
         return out.toString();
     }
 
+    /** One row per network fault mix: what was injected, what the migrations did, and the invariant checks. */
+    public static String netFaultMarkdown(List<MigrationFaultResult> results) {
+        StringBuilder out = new StringBuilder()
+            .append("| Faults injected | Runs | Sent | Accepted | Reported to sender | Lost | Duplicates | Out of order | Two live copies | Committed | Aborted | In doubt, resolved | Unresolved | Partitions | Protocol msgs lost | Sends refused by partition |\n")
+            .append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+        for (MigrationFaultResult r : results) {
+            out.append(String.format(Locale.ROOT, "| %s | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d |%n",
+                describe(r.settings()), r.settings().runs(), r.sent(), r.accepted(), r.reported(), r.lost(),
+                r.duplicates() + r.phantoms(), r.outOfOrder(), r.locationViolations(), r.committed(), r.aborted(),
+                r.inDoubtResolved(), r.unresolved(), r.partitions(), r.droppedProtocol(), r.refusedSends()));
+        }
+        return out.toString();
+    }
+
+    static String describe(MigrationFaultHarness.Settings s) {
+        StringBuilder d = new StringBuilder("delay up to ").append(s.maxDelayMillis()).append(" ms");
+        if (s.dropRate() > 0) {
+            d.append(String.format(Locale.ROOT, ", %.0f%% of protocol messages lost", s.dropRate() * 100));
+        }
+        if (s.partitionChance() > 0) {
+            d.append(String.format(Locale.ROOT, ", partition in %.0f%% of runs", s.partitionChance() * 100));
+        }
+        return d.toString();
+    }
+
     private static String describe(FaultResult r) {
         return switch (r.supervision().directive()) {
             case RESTART -> "restart, " + r.supervision().maxRestarts() + " per " + r.supervision().window().toSeconds() + " s";

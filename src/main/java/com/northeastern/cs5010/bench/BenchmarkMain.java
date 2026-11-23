@@ -28,7 +28,10 @@ public final class BenchmarkMain {
 
     static final String USAGE = "usage: BenchmarkMain [--clients N] [--ops N] [--keys N] [--shards N]"
         + " [--read-ratio R] [--hot KEYS:TRAFFIC] [--seed N] [--warmup N] [--repeat N]"
-        + " [--csv FILE] [--faults] [--fault-jobs N]";
+        + " [--csv FILE] [--faults] [--fault-jobs N] [--net-faults RUNS]";
+
+    /** Messages per randomized migration run under network faults. */
+    static final int NET_FAULT_MESSAGES = 300;
 
     static final List<String> MODELS = List.of("threads+locks", "channels", "actors");
     static final double[] CRASH_RATES = {0, 0.001, 0.01, 0.05};
@@ -92,6 +95,22 @@ public final class BenchmarkMain {
             out.println("Failure injection (" + options.shards() + " supervised workers):");
             out.println(BenchmarkReport.faultMarkdown(faults));
         }
+
+        if (options.netFaultRuns() > 0) {
+            int runs = options.netFaultRuns();
+            long seed = spec.seed();
+            List<MigrationFaultResult> net = List.of(
+                MigrationFaultHarness.run(new MigrationFaultHarness.Settings(runs, NET_FAULT_MESSAGES, 3, 0, 0, seed)),
+                MigrationFaultHarness.run(new MigrationFaultHarness.Settings(runs, NET_FAULT_MESSAGES, 2, 0.1, 0, seed)),
+                MigrationFaultHarness.run(new MigrationFaultHarness.Settings(runs, NET_FAULT_MESSAGES, 2, 0.05, 1, seed)));
+            out.println();
+            out.println("Live migration under network faults (" + runs + " randomized runs per row, "
+                + NET_FAULT_MESSAGES + " messages each, pi and cloud nodes over TCP on this machine):");
+            out.println(BenchmarkReport.netFaultMarkdown(net));
+            boolean ok = net.stream().allMatch(MigrationFaultResult::invariantsHold);
+            out.println(ok ? "All invariants held: no loss, no duplicates, in order, one live copy."
+                : "INVARIANT VIOLATION: see the table above.");
+        }
         return 0;
     }
 
@@ -111,7 +130,7 @@ public final class BenchmarkMain {
     }
 
     record Options(WorkloadSpec spec, int shards, int warmup, int repeat, Path csv, boolean faults,
-                   long faultJobs) {
+                   long faultJobs, int netFaultRuns) {
 
         static Options parse(String[] args) {
             int clients = 4;
@@ -127,6 +146,7 @@ public final class BenchmarkMain {
             Path csv = null;
             boolean faults = false;
             long faultJobs = 100_000;
+            int netFaultRuns = 0;
             for (int i = 0; i < args.length; i++) {
                 String flag = args[i];
                 switch (flag) {
@@ -149,14 +169,16 @@ public final class BenchmarkMain {
                     case "--csv" -> csv = Path.of(value(args, ++i, flag));
                     case "--faults" -> faults = true;
                     case "--fault-jobs" -> faultJobs = Long.parseLong(value(args, ++i, flag));
+                    case "--net-faults" -> netFaultRuns = Integer.parseInt(value(args, ++i, flag));
                     default -> throw new IllegalArgumentException("unknown option " + flag);
                 }
             }
-            if (shards < 1 || warmup < 0 || repeat < 1 || faultJobs < 0) {
-                throw new IllegalArgumentException("shards and repeat must be at least 1; warmup and fault jobs at least 0");
+            if (shards < 1 || warmup < 0 || repeat < 1 || faultJobs < 0 || netFaultRuns < 0) {
+                throw new IllegalArgumentException(
+                    "shards and repeat must be at least 1; warmup, fault jobs and net fault runs at least 0");
             }
             WorkloadSpec spec = new WorkloadSpec(clients, ops, keys, readRatio, hotKeys, hotTraffic, seed);
-            return new Options(spec, shards, warmup, repeat, csv, faults, faultJobs);
+            return new Options(spec, shards, warmup, repeat, csv, faults, faultJobs, netFaultRuns);
         }
 
         private static String value(String[] args, int index, String flag) {
